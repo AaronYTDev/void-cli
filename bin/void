@@ -1,0 +1,2740 @@
+#!/usr/bin/env bash
+# void: xbps and runit wrapper for people coming from systemd.
+# Bash only, nothing here needs a package Void does not already ship.
+
+set -uo pipefail
+export LC_ALL=C
+
+PROG=${0##*/}
+VERSION="1.0.0"
+
+SV_DIR=${VOID_SV_DIR:-/etc/sv}
+SERVICE_DIR=${VOID_SERVICE_DIR:-/var/service}
+LOG_DIR=${VOID_LOG_DIR:-/var/log}
+XBPS_CONF_DIR=${VOID_XBPS_CONF_DIR:-/etc/xbps.d}
+XBPS_CACHE_DIR=${VOID_XBPS_CACHE_DIR:-/var/cache/xbps}
+
+DRY_RUN=0
+ASSUME_YES=0
+QUIET=0
+FORCE_NO_COLOR=0
+SUDO_CMD=""
+
+# Parallel downloading. JOBS is empty until something sets it; pkg_jobs
+# resolves it against VOID_JOBS and the CPU count.
+PARALLEL=1
+JOBS=""
+
+C_RESET=""
+C_BOLD=""
+C_DIM=""
+C_RED=""
+C_GREEN=""
+C_YELLOW=""
+C_BLUE=""
+C_CYAN=""
+
+# --- Output helpers --------------------------------------------------
+
+setup_colors() {
+    if (( FORCE_NO_COLOR )) || [[ -n ${NO_COLOR:-} ]] || [[ ! -t 1 ]]; then
+        return 0
+    fi
+    C_RESET=$'\033[0m'
+    C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
+    C_RED=$'\033[31m'
+    C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'
+    C_BLUE=$'\033[34m'
+    C_CYAN=$'\033[36m'
+}
+
+info() {
+    (( QUIET )) || printf '%s==>%s %s\n' "$C_BLUE" "$C_RESET" "$*"
+}
+
+ok() {
+    (( QUIET )) && return 0
+    if (( DRY_RUN )); then
+        printf '%s[dry-run]%s %s\n' "$C_DIM" "$C_RESET" "$*"
+    else
+        printf '%sok:%s %s\n' "$C_GREEN" "$C_RESET" "$*"
+    fi
+}
+
+note() {
+    (( QUIET )) || printf '    %s\n' "$*"
+}
+
+warn() {
+    printf '%swarning:%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2
+}
+
+err() {
+    printf '%serror:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2
+}
+
+die() {
+    err "$*"
+    exit 1
+}
+
+have() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Run it, or print it under --dry-run.
+run() {
+    if (( DRY_RUN )); then
+        printf '%s[dry-run]%s ' "$C_DIM" "$C_RESET" >&2
+        printf '%q ' "$@" >&2
+        printf '\n' >&2
+        return 0
+    fi
+    "$@"
+}
+
+as_root() {
+    if (( EUID == 0 )); then
+        run "$@"
+    else
+        [[ -n $SUDO_CMD ]] || die "This action needs root. Install sudo/doas or run as root."
+        run "$SUDO_CMD" "$@"
+    fi
+}
+
+# as_root, for commands we need to read the output of.
+root_output() {
+    if (( EUID == 0 )); then
+        "$@"
+    else
+        [[ -n $SUDO_CMD ]] || die "This action needs root. Install sudo/doas or run as root."
+        "$SUDO_CMD" "$@"
+    fi
+}
+
+confirm() {
+    local prompt=$1 default=${2:-n} answer
+    (( ASSUME_YES )) && return 0
+    if [[ ! -t 0 ]]; then
+        warn "Not running interactively; use --yes to confirm."
+        return 1
+    fi
+    if [[ $default == y ]]; then
+        prompt="$prompt [Y/n] "
+    else
+        prompt="$prompt [y/N] "
+    fi
+    read -r -p "$prompt" answer || return 1
+    answer=${answer:-$default}
+    [[ ${answer,,} == y* ]]
+}
+
+# --- Small utilities -------------------------------------------------
+
+format_duration() {
+    local seconds=${1:-0}
+    [[ $seconds =~ ^[0-9]+$ ]] || seconds=0
+    if (( seconds < 60 )); then
+        printf '%ds' "$seconds"
+    elif (( seconds < 3600 )); then
+        printf '%dm' "$((seconds / 60))"
+    elif (( seconds < 86400 )); then
+        printf '%dh %dm' "$((seconds / 3600))" "$(((seconds % 3600) / 60))"
+    else
+        printf '%dd %dh' "$((seconds / 86400))" "$(((seconds % 86400) / 3600))"
+    fi
+}
+
+is_void() {
+    [[ -r /etc/os-release ]] && grep -Eq '^ID="?void"?$' /etc/os-release 2>/dev/null
+}
+
+require_void() {
+    is_void || warn "This system does not identify as Void Linux; things may not work as expected."
+}
+
+require_xbps() {
+    local missing=() tool
+    for tool in xbps-install xbps-remove xbps-query xbps-pkgdb xbps-reconfigure; do
+        have "$tool" || missing+=("$tool")
+    done
+    ((${#missing[@]} == 0)) || die "Missing XBPS tools: ${missing[*]}"
+}
+
+require_runit() {
+    have sv || die "The 'sv' command is missing. Is runit installed?"
+}
+
+service_exists() {
+    [[ -d "$SV_DIR/$1" ]]
+}
+
+service_enabled() {
+    [[ -L "$SERVICE_DIR/$1" || -e "$SERVICE_DIR/$1" ]]
+}
+
+service_link_is_symlink() {
+    [[ -L "$SERVICE_DIR/$1" ]]
+}
+
+state_color() {
+    case "$1" in
+        run)  printf '%s' "$C_GREEN" ;;
+        down) printf '%s' "$C_YELLOW" ;;
+        fail) printf '%s' "$C_RED" ;;
+        off)  printf '%s' "$C_DIM" ;;
+        *)    printf '%s' "$C_CYAN" ;;
+    esac
+}
+
+# Rewrite sv status detail as "pid 123, up 2m".
+format_sv_detail() {
+    local detail=$1 state=$2
+    if [[ $detail =~ \(pid\ ([0-9]+)\)\ ([0-9]+)s ]]; then
+        printf 'pid %s, up %s' "${BASH_REMATCH[1]}" "$(format_duration "${BASH_REMATCH[2]}")"
+    elif [[ $detail =~ ^([0-9]+)s$ ]]; then
+        printf '%s for %s' "$state" "$(format_duration "${BASH_REMATCH[1]}")"
+    elif [[ $detail =~ ^([0-9]+)s,\ (.*)$ ]]; then
+        printf '%s for %s (%s)' "$state" \
+            "$(format_duration "${BASH_REMATCH[1]}")" "${BASH_REMATCH[2]}"
+    else
+        printf '%s' "$detail"
+    fi
+}
+
+# Wait for runsvdir to pick up a freshly linked service.
+wait_for_supervise() {
+    local name=$1 i
+    (( DRY_RUN )) && return 0
+    if [[ $SUDO_CMD == doas ]]; then
+        sleep 1
+        return 0
+    fi
+    for ((i = 0; i < 50; i++)); do
+        if (( EUID == 0 )); then
+            [[ -e "$SERVICE_DIR/$name/supervise/ok" ]] && return 0
+        else
+            "$SUDO_CMD" -n test -e "$SERVICE_DIR/$name/supervise/ok" 2>/dev/null && return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
+
+# sv, quiet on success and verbose on failure.
+sv_do_quiet() {
+    local action=$1 name=$2 output
+    if (( DRY_RUN )); then
+        as_root sv "$action" "$name"
+        return $?
+    fi
+    if output=$(root_output sv "$action" "$name" 2>&1); then
+        return 0
+    fi
+    if [[ -n $output ]]; then
+        printf '%s\n' "$output" | sed 's/^/  /' >&2
+    fi
+    return 1
+}
+
+# --- General help ----------------------------------------------------
+
+usage() {
+    cat <<'EOF'
+void: xbps and runit helper for Void Linux
+
+Usage:
+  void <command> [options]
+
+Packages (XBPS):
+  void pkg install <pkg...>      Install one or more packages
+  void pkg install -j <n> ...    Install with n parallel downloads
+  void pkg remove <pkg...>       Remove packages          (alias: rm)
+  void pkg update                Refresh repository indexes
+  void pkg upgrade [pkg...]      Upgrade everything or selected packages
+  void pkg search <term>         Search the repositories
+  void pkg info <pkg>            Show package information
+  void pkg list                  List installed packages
+  void pkg autoremove            Remove orphan packages
+  void pkg clean                 Clean the package cache
+  void pkg hold <pkg>            Prevent a package from being upgraded
+  void pkg repo available        Add third-party repositories by name
+  void pkg repo add <name>       Enable a catalog repository
+  void pkg help                  Show all package commands
+
+Services (runit):
+  void svc list                  Show enabled services and their state
+  void svc status [name...]      Show detailed service status
+  void svc start <name...>       Start a service (enables it if needed)
+  void svc stop <name...>        Stop a service
+  void svc restart <name...>     Restart a service
+  void svc reload <name...>      Send SIGHUP to a service
+  void svc enable [--now] <name> Enable a service at boot
+  void svc disable <name...>     Stop and disable a service
+  void svc logs <name>           Show a service's log
+  void svc edit <name>           Edit a service's run script
+  void svc create <name> --exec "command"
+                                 Create a new runit service
+  void svc help                  Show all service commands
+
+System:
+  void update                    Sync repositories and upgrade everything
+  void info                      Show a system overview
+  void logs [-f] <service>       View or follow service logs
+  void doctor                    Check for common Void issues
+  void cheat [topic]             systemd → Void translation table
+  void repo list                 Show configured repositories
+  void repo add <name>           Alias for "void pkg repo add"
+  void desktop refresh           Rebuild desktop, icon and MIME caches
+
+Global options:
+  -n, --dry-run                  Print commands instead of running them
+  -y, --yes                      Answer yes to prompts
+  -q, --quiet                    Less output
+      --no-color                 Disable colors (also respects NO_COLOR)
+
+Examples:
+  void pkg install neovim htop git
+  void svc enable --now bluetoothd
+  void logs -f NetworkManager
+  void svc create myservice --exec "/usr/bin/myservice --flag" --enable
+  void cheat systemctl
+
+Void uses runit instead of systemd. Services are plain shell scripts in
+/etc/sv/<name>, enabled by symlinking them into /var/service.
+EOF
+}
+
+pkg_usage() {
+    cat <<'EOF'
+void pkg: package management with XBPS
+
+Usage:
+  void pkg <command> [options]
+
+Commands:
+  install <pkg...>       Install packages
+  remove <pkg...>        Remove packages (alias: rm)
+  update                 Refresh repository indexes only
+  upgrade [pkg...]       Upgrade all or selected packages
+  search <term>          Search repositories (--installed to search locally)
+  info <pkg>             Show package details
+  list                   List installed packages
+  files <pkg>            List files owned by a package
+  owns <path>            Find which package owns a path
+  deps <pkg>             Show dependencies
+  revdeps <pkg>          Show reverse dependencies
+  hold <pkg>             Hold a package at its current version
+  unhold <pkg>           Release a held package
+  reconfigure <pkg>      Re-run a package's post-install configuration
+  autoremove             Remove orphan packages
+  clean                  Remove old packages from the cache
+  repo                   Manage repositories and add third-party ones
+
+Options:
+  -y, --yes              Assume yes
+  -n, --dry-run          Only print what would run
+  -h, --help             Show this help
+
+Install and upgrade options:
+  -j, --jobs <n>         Parallel downloads to run at once (default: CPU count)
+  -P, --parallel         Enable parallel downloading (default)
+  --no-parallel          Download one package at a time, like plain xbps
+  -f, --force            Force reinstallation
+
+Parallel downloads
+  XBPS fetches one archive at a time. void resolves the transaction first,
+  pulls the missing archives concurrently, and leaves them in /var/cache/xbps
+  so the real install finds them already on disk. Every archive is decompress
+  tested before it is used, because a corrupt one in the cache makes
+  xbps-install abort instead of retrying, and any failure falls back to a
+  normal download. Set VOID_JOBS to change the default concurrency.
+
+Examples:
+  void pkg install firefox
+  void pkg install neovim git -j 8
+  void pkg upgrade --no-parallel
+  void pkg search wayland
+  void pkg list --manual
+  void pkg autoremove
+EOF
+}
+
+svc_usage() {
+    cat <<'EOF'
+void svc: managing runit services
+
+Usage:
+  void svc <command> [options]
+
+Commands:
+  list [--all]           List enabled services (--all includes available ones)
+  status [name...]       Show detailed status
+  start <name...>        Start a service; enables it first if necessary
+  stop <name...>         Stop a service
+  restart <name...>      Restart a service
+  reload <name...>       Send SIGHUP to a service
+  enable [--now] <name>  Enable a service at boot; --now also starts it
+  disable <name...>      Stop and disable a service
+  logs [-f] <name>       Show the service log
+  edit <name>            Edit /etc/sv/<name>/run
+  create <name> ...      Create a new service (see below)
+
+Create options:
+  --exec "command"       Command to run (required)
+  --user user[:group]    Run as this user via chpst
+  --no-log               Do not create an svlogd log service
+  --enable               Enable and start the new service
+  --yes                  Do not ask to enable it
+
+Notes:
+  runit has no "transient" services. `void svc start foo` enables foo
+  first, so it will also start after a reboot. Use `void svc disable`
+  if you do not want that.
+  There is no daemon-reload: edit the run script and restart the service.
+
+Examples:
+  void svc list
+  void svc enable --now bluetoothd
+  void logs -f NetworkManager
+  void svc create backup --exec "/usr/local/bin/backup --daemon"
+EOF
+}
+
+logs_usage() {
+    cat <<'EOF'
+void logs: view runit service logs
+
+Usage:
+  void logs [-f] [-n LINES] <service|file>
+  void logs --list
+
+Options:
+  -f, --follow           Keep following the log
+  -n, --lines N          Number of lines to show (default: 50)
+      --list             List known log files and services with logs
+
+Examples:
+  void logs NetworkManager
+  void logs -f -n 200 sddm
+  void logs /var/log/dmesg.log
+EOF
+}
+
+desktop_usage() {
+    cat <<'EOF'
+void desktop: refresh desktop integration caches
+
+Usage:
+  void desktop refresh [--user] [--no-icons] [--no-mime]
+
+Commands:
+  refresh                Rebuild desktop, icon, and MIME caches
+
+Options:
+  --user                 Only refresh caches under ~/.local (no sudo)
+  --no-icons             Skip icon theme caches
+  --no-mime              Skip the shared MIME database
+  -h, --help             Show this help
+
+Run these by hand instead if you prefer:
+  sudo update-desktop-database /usr/share/applications
+  sudo gtk-update-icon-cache -f -t /usr/share/icons/<theme>
+  sudo update-mime-database /usr/share/mime
+
+Examples:
+  void desktop refresh
+  void desktop refresh --user
+EOF
+}
+
+repo_usage() {
+    cat <<'EOF'
+void pkg repo: manage XBPS repositories
+
+Usage:
+  void pkg repo [list]
+  void pkg repo available [term]
+  void pkg repo info <name>
+  void pkg repo add <name|url> [--name NAME]
+  void pkg repo remove <name|file>
+  void pkg repo disable <name|file>
+  void pkg repo enable <name|file>
+  void pkg repo refresh
+
+Commands:
+  list                   Show configured repositories (default)
+  available [term]       List the built-in catalog of third-party repos
+  info <name>            Show details for a catalog repository
+  add <name|url>         Add a catalog repo by name, or any repo by URL
+  remove <name|file>     Delete a repository config
+  disable <name|file>    Keep the config but stop using it
+  enable <name|file>     Re-enable a disabled config
+  refresh                Download fresh repository indexes
+
+Options:
+  -y, --yes              Assume yes
+  -n, --dry-run          Only print what would run
+  -h, --help             Show this help
+
+The catalog includes BlackHole, Hyprland, LibreWolf, XLibre, SonicDE,
+Noid, Kennel, LinuxNauta, voiders.dev, Neko, Lazy, grvn, and the VUP
+package categories. Run "void pkg repo available" for the full list.
+
+Examples:
+  void pkg repo available
+  void pkg repo info blackhole
+  void pkg repo add blackhole
+  void pkg repo add vup-browsers
+  void pkg repo add https://repo.example.org/void --name example
+  void pkg repo disable blackhole
+  void pkg repo remove blackhole
+EOF
+}
+
+# --- Parallel package downloads --------------------------------------
+#
+# XBPS fetches one archive at a time. It does, however, use any archive that
+# is already sitting in its cache with the right size, so the cheapest way to
+# parallelise an install is:
+#
+#   1. resolve the transaction with `xbps-install -n` (no network, no root),
+#   2. fetch the missing archives concurrently,
+#   3. drop them into the cache,
+#   4. run the real `xbps-install`, which finds them already on disk.
+#
+# Everything here fails soft. No curl, no xargs, an unreadable package DB, a
+# dead mirror — every one of those just means the plain install runs instead.
+
+# --jobs, then VOID_JOBS, then nproc.
+pkg_jobs() {
+    local jobs=${JOBS:-${VOID_JOBS:-}}
+    if [[ -z $jobs ]]; then
+        jobs=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+    fi
+    [[ $jobs =~ ^[0-9]+$ ]] || jobs=4
+    (( jobs < 1 )) && jobs=1
+    (( jobs > 32 )) && jobs=32
+    printf '%s\n' "$jobs"
+}
+
+# Byte size of a file, empty if it is not there.
+file_size() {
+    stat -c %s -- "$1" 2>/dev/null || wc -c <"$1" 2>/dev/null || true
+}
+
+# Confirm a downloaded archive is intact before it reaches the cache. A
+# corrupt archive in /var/cache/xbps does not fall back to a fresh download:
+# xbps-install aborts the whole transaction, so this check is load-bearing.
+# The .xbps files are zstd streams, and `zstd -t` decompresses at hundreds of
+# MB/s, so testing every archive costs almost nothing.
+pkg_check_one() {
+    local dest=$1
+    if have zstd; then
+        if ! zstd -tq -- "$dest" >/dev/null 2>&1; then
+            rm -f -- "$dest" "$dest.sig2"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+pkg_prefetch_parallel() {
+    local jobs=$1
+    shift
+
+    (( jobs > 1 )) || return 0
+    (( PARALLEL )) || return 0
+    (( DRY_RUN )) && return 0
+    have curl || return 0
+    have xargs || return 0
+    [[ -d $XBPS_CACHE_DIR ]] || return 0
+
+    # A dry run reads only the local package DB and the repository indexes
+    # already on disk. There is deliberately no -S here: resolving the
+    # transaction must never turn into a network operation.
+    local plan
+    plan=$(xbps-install -n "$@" 2>/dev/null) || return 0
+    [[ -n $plan ]] || return 0
+
+    local tmp
+    tmp=$(mktemp -d 2>/dev/null) || return 0
+
+    local pkgver action arch repo isize dsize file url cached_size
+    local -a fetch=() dests=() sizes=()
+    local total=0
+
+    while read -r pkgver action arch repo isize dsize; do
+        [[ -n $pkgver && -n $repo ]] || continue
+        case $action in
+            install|update|downgrade) ;;
+            *) continue ;;
+        esac
+        [[ $repo =~ ^https?:// ]] || continue
+        [[ $pkgver =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || continue
+        [[ $arch =~ ^[A-Za-z0-9_]+$ ]] || continue
+        [[ $dsize =~ ^[0-9]+$ ]] || continue
+
+        file="$pkgver.$arch.xbps"
+        url="${repo%/}/$file"
+
+        # Already cached at the expected size with its signature: reusable.
+        if [[ -f $XBPS_CACHE_DIR/$file && -f $XBPS_CACHE_DIR/$file.sig2 ]]; then
+            cached_size=$(file_size "$XBPS_CACHE_DIR/$file")
+            [[ $cached_size == "$dsize" ]] && continue
+        fi
+
+        fetch+=("$tmp/$file" "$url")
+        fetch+=("$tmp/$file.sig2" "$url.sig2")
+        pkgs+=("$pkgver")
+        dests+=("$tmp/$file")
+        sizes+=("$dsize")
+        total=$((total + 1))
+    done <<<"$plan"
+
+    if (( total == 0 )); then
+        rm -rf -- "$tmp"
+        return 0
+    fi
+
+    info "Fetching $total package(s) with $jobs parallel downloads"
+
+    # xargs appends the pair from fetch() to the command line, so curl sees
+    # "-o <destination> <url>" for each archive. A failure here is not fatal;
+    # it just means xbps-install fetches that package itself.
+    printf '%s\n' "${fetch[@]}" |
+        xargs -P "$jobs" -n 2 curl -fsSL --retry 2 --retry-delay 1 \
+            --connect-timeout 15 --max-time 900 -o 2>/dev/null || true
+
+    # Drop anything that did not land at the advertised size.
+    local i dest want size
+    local -a check=()
+    for i in "${!dests[@]}"; do
+        dest=${dests[i]}
+        want=${sizes[i]}
+        [[ -f $dest ]] || continue
+        size=$(file_size "$dest")
+        if [[ $size != "$want" ]]; then
+            rm -f -- "$dest" "$dest.sig2"
+            continue
+        fi
+        check+=("$dest")
+    done
+
+    # Decompress-test every archive in parallel; zstd is fast enough that this
+    # is lost in the download time, and it keeps corruption out of the cache.
+    if ((${#check[@]})) && have zstd; then
+        export -f pkg_check_one
+        printf '%s\n' "${check[@]}" |
+            xargs -P "$jobs" -n 1 bash -c 'pkg_check_one "$1"' _ \
+            >/dev/null 2>&1 || true
+    fi
+
+    local got=0
+    local -a ready=()
+    for dest in "${dests[@]}"; do
+        [[ -s $dest ]] || continue
+        ready+=("$dest")
+        got=$((got + 1))
+        # The detached signature is tiny; without it xbps makes one extra
+        # round trip per package, which defeats the point of prefetching.
+        [[ -s $dest.sig2 ]] && ready+=("$dest.sig2")
+    done
+
+    if (( got == 0 )); then
+        rm -rf -- "$tmp"
+        note "Nothing prefetched; continuing with a normal download."
+        return 0
+    fi
+
+    if as_root install -m 0644 -- "${ready[@]}" "$XBPS_CACHE_DIR" >/dev/null 2>&1; then
+        ok "Prefetched $got package(s) into $XBPS_CACHE_DIR."
+    else
+        warn "Could not write to $XBPS_CACHE_DIR; downloading normally."
+    fi
+    rm -rf -- "$tmp"
+    return 0
+}
+
+# --- Package commands ------------------------------------------------
+
+pkg_install() {
+    local -a packages=()
+    local force=0
+
+    while (($#)); do
+        case "$1" in
+            -y|--yes) ASSUME_YES=1 ;;
+            -n|--dry-run) DRY_RUN=1 ;;
+            -f|--force) force=1 ;;
+            -j|--jobs) shift; JOBS=${1:-} ;;
+            -j*) JOBS=${1#-j} ;;
+            --jobs=*) JOBS=${1#--jobs=} ;;
+            -P|--parallel) PARALLEL=1 ;;
+            --no-parallel) PARALLEL=0 ;;
+            -h|--help) pkg_usage; return 0 ;;
+            --) shift; packages+=("$@"); break ;;
+            -*) die "Unknown option for 'void pkg install': $1" ;;
+            *) packages+=("$1") ;;
+        esac
+        shift
+    done
+
+    ((${#packages[@]})) || die "Usage: void pkg install <package...>"
+    require_void
+    require_xbps
+
+    local -a args=()
+    local -a plan=()
+    (( force )) && args+=(-f) && plan+=(-f)
+    (( ASSUME_YES )) && args+=(-y)
+
+    if (( PARALLEL )); then
+        pkg_prefetch_parallel "$(pkg_jobs)" "${plan[@]}" "${packages[@]}"
+    fi
+
+    info "Installing: ${packages[*]}"
+    if as_root xbps-install "${args[@]}" "${packages[@]}"; then
+        ok "Finished."
+        note "New service? Run 'void svc list' to see what is available."
+    else
+        err "Installation failed."
+        note "Package not found? Refresh indexes first: void pkg update"
+        return 1
+    fi
+}
+
+pkg_remove() {
+    local -a packages=()
+    local recursive=0 force=0
+
+    while (($#)); do
+        case "$1" in
+            -y|--yes) ASSUME_YES=1 ;;
+            -n|--dry-run) DRY_RUN=1 ;;
+            -R|--recursive) recursive=1 ;;
+            -F|--force) force=1 ;;
+            -h|--help) pkg_usage; return 0 ;;
+            --) shift; packages+=("$@"); break ;;
+            -*) die "Unknown option for 'void pkg remove': $1" ;;
+            *) packages+=("$1") ;;
+        esac
+        shift
+    done
+
+    ((${#packages[@]})) || die "Usage: void pkg remove <package...>"
+    require_void
+    require_xbps
+
+    local -a args=()
+    (( recursive )) && args+=(-R)
+    (( force )) && args+=(-F)
+    (( ASSUME_YES )) && args+=(-y)
+
+    info "Removing: ${packages[*]}"
+    if as_root xbps-remove "${args[@]}" "${packages[@]}"; then
+        ok "Removed."
+        note "Clean up dependencies with: void pkg autoremove"
+    else
+        err "Removal failed."
+        return 1
+    fi
+}
+
+pkg_update() {
+    while (($#)); do
+        case "$1" in
+            -y|--yes) ASSUME_YES=1 ;;
+            -n|--dry-run) DRY_RUN=1 ;;
+            -h|--help) pkg_usage; return 0 ;;
+            -*) die "Unknown option for 'void pkg update': $1" ;;
+            *) die "void pkg update takes no package names." ;;
+        esac
+        shift
+    done
+    require_void
+    require_xbps
+
+    info "Refreshing repository indexes"
+    if as_root xbps-install -S; then
+        ok "Repository indexes refreshed."
+        note "Upgrade packages with: void pkg upgrade"
+    else
+        err "Could not refresh repository indexes."
+        note "Check your network and repositories: void repo list"
+        return 1
+    fi
+}
+
+pkg_upgrade() {
+    local -a packages=()
+    local force=0
+
+    while (($#)); do
+        case "$1" in
+            -y|--yes) ASSUME_YES=1 ;;
+            -n|--dry-run) DRY_RUN=1 ;;
+            -f|--force) force=1 ;;
+            -j|--jobs) shift; JOBS=${1:-} ;;
+            -j*) JOBS=${1#-j} ;;
+            --jobs=*) JOBS=${1#--jobs=} ;;
+            -P|--parallel) PARALLEL=1 ;;
+            --no-parallel) PARALLEL=0 ;;
+            -h|--help) pkg_usage; return 0 ;;
+            --) shift; packages+=("$@"); break ;;
+            -*) die "Unknown option for 'void pkg upgrade': $1" ;;
+            *) packages+=("$1") ;;
+        esac
+        shift
+    done
+    require_void
+    require_xbps
+
+    local -a args=(-S -u)
+    local -a plan=(-u)
+    (( force )) && args+=(-f) && plan+=(-f)
+    (( ASSUME_YES )) && args+=(-y)
+
+    if (( PARALLEL )); then
+        # Prefetch against fresh indexes, otherwise the resolved transaction
+        # can be a version behind what the upgrade is about to pick up.
+        if as_root xbps-install -S >/dev/null 2>&1; then
+            args=(-u)
+            (( force )) && args+=(-f)
+            (( ASSUME_YES )) && args+=(-y)
+        else
+            warn "Could not refresh indexes; upgrading against the local copy."
+        fi
+        if ((${#packages[@]})); then
+            pkg_prefetch_parallel "$(pkg_jobs)" "${plan[@]}" "${packages[@]}"
+        else
+            pkg_prefetch_parallel "$(pkg_jobs)" "${plan[@]}"
+        fi
+    fi
+
+    if ((${#packages[@]})); then
+        info "Upgrading: ${packages[*]}"
+        if as_root xbps-install "${args[@]}" "${packages[@]}"; then
+            ok "Upgrade finished."
+        else
+            err "Upgrade failed."
+            return 1
+        fi
+    else
+        info "Upgrading all installed packages"
+        if as_root xbps-install "${args[@]}"; then
+            ok "System upgraded."
+        else
+            err "System upgrade failed."
+            return 1
+        fi
+    fi
+}
+
+pkg_search() {
+    local term="" installed=0 regex=0
+
+    while (($#)); do
+        case "$1" in
+            -i|--installed) installed=1 ;;
+            -r|--regex) regex=1 ;;
+            -h|--help) pkg_usage; return 0 ;;
+            -*) die "Unknown option for 'void pkg search': $1" ;;
+            *) term=$1 ;;
+        esac
+        shift
+    done
+
+    [[ -n $term ]] || die "Usage: void pkg search <term>"
+    require_xbps
+
+    local -a args=()
+    if (( installed )); then
+        args=(-s)
+    else
+        args=(-R -s)
+    fi
+    (( regex )) && args+=(--regex)
+
+    local output
+    output=$(xbps-query "${args[@]}" "$term") || true
+    if [[ -z $output ]]; then
+        warn "No packages found for '$term'."
+        return 1
+    fi
+    printf '%s\n' "$output"
+}
+
+pkg_info() {
+    local package=${1:-}
+    [[ -n $package ]] || die "Usage: void pkg info <package>"
+    require_xbps
+
+    if xbps-query -S "$package" >/dev/null 2>&1; then
+        info "Installed package: $package"
+        xbps-query -S "$package"
+        local repo_version
+        repo_version=$(xbps-query -R -p pkgver "$package" 2>/dev/null || true)
+        [[ -n $repo_version ]] && printf '\nRepository version: %s\n' "$repo_version"
+    else
+        info "Repository package: $package"
+        if ! xbps-query -R -S "$package"; then
+            err "Package '$package' was not found."
+            note "Try: void pkg search $package"
+            return 1
+        fi
+    fi
+}
+
+pkg_list() {
+    local mode=installed filter=""
+
+    while (($#)); do
+        case "$1" in
+            --manual) mode=manual ;;
+            --orphans) mode=orphans ;;
+            --hold|--held) mode=hold ;;
+            --repos|--repositories) mode=repos ;;
+            -h|--help) pkg_usage; return 0 ;;
+            -*) die "Unknown option for 'void pkg list': $1" ;;
+            *) filter=$1 ;;
+        esac
+        shift
+    done
+    require_xbps
+
+    local -a args=()
+    case "$mode" in
+        installed) args=(-l) ;;
+        manual) args=(-m) ;;
+        orphans) args=(-O) ;;
+        hold) args=(-H) ;;
+        repos) args=(-L) ;;
+    esac
+
+    local output
+    output=$(xbps-query "${args[@]}") || true
+    if [[ -n $filter ]]; then
+        output=$(printf '%s\n' "$output" | grep -i -- "$filter" || true)
+    fi
+    if [[ -z $output ]]; then
+        if [[ $mode == orphans ]]; then
+            ok "No orphan packages."
+            return 0
+        fi
+        warn "No matching packages."
+        return 1
+    fi
+    printf '%s\n' "$output"
+}
+
+pkg_files() {
+    local package=${1:-}
+    [[ -n $package ]] || die "Usage: void pkg files <package>"
+    require_xbps
+    if ! xbps-query -f "$package"; then
+        err "Could not list files for '$package'."
+        note "Only installed packages have a file list."
+        return 1
+    fi
+}
+
+pkg_owns() {
+    local path=${1:-}
+    [[ -n $path ]] || die "Usage: void pkg owns <path>"
+    require_xbps
+    if ! xbps-query -o "$path"; then
+        warn "No installed package owns '$path'."
+        return 1
+    fi
+}
+
+pkg_deps() {
+    local reverse=0 package=""
+
+    while (($#)); do
+        case "$1" in
+            -X|--reverse|--revdeps) reverse=1 ;;
+            -h|--help) pkg_usage; return 0 ;;
+            -*) die "Unknown option for 'void pkg deps': $1" ;;
+            *) package=$1 ;;
+        esac
+        shift
+    done
+    [[ -n $package ]] || die "Usage: void pkg deps [--reverse] <package>"
+    require_xbps
+    if (( reverse )); then
+        xbps-query -X "$package"
+    else
+        xbps-query -x "$package"
+    fi
+}
+
+pkg_hold() {
+    local package=${1:-}
+    [[ -n $package ]] || die "Usage: void pkg hold <package>"
+    require_xbps
+    info "Holding '$package' at its current version."
+    as_root xbps-pkgdb -m hold "$package" || return 1
+    ok "Held. Upgrade it later with 'void pkg unhold $package'."
+}
+
+pkg_unhold() {
+    local package=${1:-}
+    [[ -n $package ]] || die "Usage: void pkg unhold <package>"
+    require_xbps
+    info "Releasing '$package'."
+    as_root xbps-pkgdb -m unhold "$package" || return 1
+    ok "Released."
+}
+
+pkg_reconfigure() {
+    local all=0 package=""
+
+    while (($#)); do
+        case "$1" in
+            -a|--all) all=1 ;;
+            -y|--yes) ASSUME_YES=1 ;;
+            -n|--dry-run) DRY_RUN=1 ;;
+            -h|--help) pkg_usage; return 0 ;;
+            -*) die "Unknown option for 'void pkg reconfigure': $1" ;;
+            *) package=$1 ;;
+        esac
+        shift
+    done
+    require_xbps
+
+    if (( all )); then
+        info "Reconfiguring all packages"
+        as_root xbps-reconfigure -f -a
+    else
+        [[ -n $package ]] || die "Usage: void pkg reconfigure <package> | --all"
+        info "Reconfiguring '$package'"
+        as_root xbps-reconfigure -f "$package"
+    fi
+}
+
+pkg_autoremove() {
+    while (($#)); do
+        case "$1" in
+            -y|--yes) ASSUME_YES=1 ;;
+            -n|--dry-run) DRY_RUN=1 ;;
+            -h|--help) pkg_usage; return 0 ;;
+            *) die "Unknown option for 'void pkg autoremove': $1" ;;
+        esac
+        shift
+    done
+    require_xbps
+
+    local orphans
+    orphans=$(xbps-query -O 2>/dev/null || true)
+    if [[ -z $orphans ]]; then
+        ok "No orphan packages."
+        return 0
+    fi
+    info "Orphan packages:"
+    printf '%s\n' "$orphans" | sed 's/^/  /'
+    local -a args=(-o)
+    (( ASSUME_YES )) && args+=(-y)
+    if as_root xbps-remove "${args[@]}"; then
+        ok "Orphans removed."
+    else
+        err "Could not remove orphans."
+        return 1
+    fi
+}
+
+pkg_clean() {
+    local all=0
+    while (($#)); do
+        case "$1" in
+            -y|--yes) ASSUME_YES=1 ;;
+            -n|--dry-run) DRY_RUN=1 ;;
+            -a|--all) all=1 ;;
+            -h|--help) pkg_usage; return 0 ;;
+            *) die "Unknown option for 'void pkg clean': $1" ;;
+        esac
+        shift
+    done
+    require_xbps
+
+    local -a args=(-O)
+    (( all )) && args+=(-O)
+    (( ASSUME_YES )) && args+=(-y)
+    info "Cleaning the package cache"
+    if as_root xbps-remove "${args[@]}"; then
+        ok "Cache cleaned."
+    else
+        err "Could not clean the cache."
+        return 1
+    fi
+}
+
+cmd_pkg() {
+    local sub=${1:-help}
+    (($#)) && shift
+
+    case "$sub" in
+        install|add|i) pkg_install "$@" ;;
+        remove|rm|del) pkg_remove "$@" ;;
+        update|sync|refresh) pkg_update "$@" ;;
+        upgrade|up|sysupgrade|full-upgrade) pkg_upgrade "$@" ;;
+        search|find) pkg_search "$@" ;;
+        info|show) pkg_info "$@" ;;
+        list|ls) pkg_list "$@" ;;
+        files|file) pkg_files "$@" ;;
+        owns|owner|which) pkg_owns "$@" ;;
+        deps|depends) pkg_deps "$@" ;;
+        revdeps|rdeps) pkg_deps --reverse "$@" ;;
+        hold) pkg_hold "$@" ;;
+        unhold) pkg_unhold "$@" ;;
+        reconfigure|reconfig) pkg_reconfigure "$@" ;;
+        autoremove|orphans) pkg_autoremove "$@" ;;
+        clean|cache) pkg_clean "$@" ;;
+        repo|repos|repositories) cmd_pkg_repo "$@" ;;
+        help|-h|--help) pkg_usage ;;
+        *) die "Unknown package command: '$sub'. Run 'void pkg help'." ;;
+    esac
+}
+
+# --- Service commands ------------------------------------------------
+
+svc_enable_one() {
+    local name=$1
+    local link="$SERVICE_DIR/$name"
+
+    if service_enabled "$name"; then
+        if [[ -L $link && ! -e $link ]]; then
+            warn "Service '$name' has a broken symlink: $link"
+            note "Remove it with 'void svc disable $name' and enable it again."
+            return 1
+        fi
+        ok "Service '$name' is already enabled."
+        return 0
+    fi
+
+    as_root ln -s "$SV_DIR/$name" "$link" || {
+        err "Could not enable '$name'."
+        return 1
+    }
+    ok "Enabled '$name'."
+}
+
+svc_start_one() {
+    local name=$1
+
+    if ! service_exists "$name" && ! (( DRY_RUN )); then
+        err "No such service: '$name'"
+        note "List available services with: void svc list --all"
+        return 1
+    fi
+
+    if ! service_enabled "$name"; then
+        info "Service '$name' is not enabled; enabling it now."
+        note "runit has no transient services, so this also enables it at boot."
+        svc_enable_one "$name" || return 1
+        wait_for_supervise "$name" || warn "runsvdir is taking a while to notice '$name'."
+    fi
+
+    if sv_do_quiet start "$name"; then
+        ok "Started '$name'."
+    else
+        err "Could not start '$name'."
+        note "Check its run script: $SV_DIR/$name/run"
+        return 1
+    fi
+}
+
+svc_stop_one() {
+    local name=$1
+    if ! service_exists "$name"; then
+        err "No such service: '$name'"
+        return 1
+    fi
+    if ! service_enabled "$name"; then
+        warn "Service '$name' is not enabled and is probably not running."
+        return 1
+    fi
+    if sv_do_quiet stop "$name"; then
+        ok "Stopped '$name'."
+    else
+        err "Could not stop '$name'."
+        return 1
+    fi
+}
+
+svc_restart_one() {
+    local name=$1
+    if ! service_exists "$name"; then
+        err "No such service: '$name'"
+        return 1
+    fi
+    if ! service_enabled "$name"; then
+        info "Service '$name' is not enabled; starting it."
+        svc_start_one "$name"
+        return
+    fi
+    if sv_do_quiet restart "$name"; then
+        ok "Restarted '$name'."
+    else
+        err "Could not restart '$name'."
+        return 1
+    fi
+}
+
+svc_reload_one() {
+    local name=$1
+    if ! service_exists "$name"; then
+        err "No such service: '$name'"
+        return 1
+    fi
+    if ! service_enabled "$name"; then
+        err "Service '$name' is not enabled."
+        return 1
+    fi
+    if sv_do_quiet reload "$name"; then
+        ok "Sent SIGHUP to '$name'."
+    else
+        err "Could not reload '$name'."
+        note "Not every service supports reload; try: void svc restart $name"
+        return 1
+    fi
+}
+
+svc_disable_one() {
+    local name=$1
+    local link="$SERVICE_DIR/$name"
+
+    if ! service_enabled "$name"; then
+        ok "Service '$name' is already disabled."
+        return 0
+    fi
+
+    if ! service_link_is_symlink "$name"; then
+        err "'$link' is not a symlink; refusing to remove it."
+        return 1
+    fi
+
+    if ! (( DRY_RUN )); then
+        confirm "Stop and disable '$name'?" n || return 1
+        as_root sv stop "$name" >/dev/null 2>&1 || true
+    else
+        as_root sv stop "$name"
+    fi
+
+    if as_root rm -f "$link"; then
+        ok "Disabled '$name'."
+        note "runsvdir will stop it shortly (it was already asked to stop)."
+    else
+        err "Could not disable '$name'."
+        return 1
+    fi
+}
+
+svc_status_one() {
+    local name=$1
+    local link="$SERVICE_DIR/$name"
+
+    if ! service_exists "$name"; then
+        err "No such service: '$name'"
+        return 1
+    fi
+
+    printf '%sService:%s   %s\n' "$C_BOLD" "$C_RESET" "$name"
+    if service_enabled "$name"; then
+        printf 'Enabled:    yes (%s)\n' "$link"
+    else
+        printf 'Enabled:    no\n'
+    fi
+
+    if service_enabled "$name"; then
+        local output=""
+        if (( EUID == 0 )) || [[ -n $SUDO_CMD ]]; then
+            output=$(root_output sv status "$link" 2>/dev/null) || true
+        fi
+        if [[ -z $output ]]; then
+            printf 'State:      unknown (could not read supervise status)\n'
+            note "Run this with sudo or as root for live status."
+        else
+            local state=${output%%:*}
+            local main=${output%%;*}
+            local pathpart=${main#*: }
+            local detail
+            detail=$(format_sv_detail "${pathpart#*: }" "$state")
+            local logpart="" logstate=""
+            if [[ $output == *"; "* ]]; then
+                logpart=${output#*; }
+                logstate=${logpart%%:*}
+            fi
+            printf 'State:      %s%s%s\n' "$(state_color "$state")" "$state" "$C_RESET"
+            [[ -n $detail ]] && printf 'Detail:     %s\n' "$detail"
+            [[ -n $logstate ]] && printf 'Log:        %s\n' "$logstate"
+        fi
+    else
+        printf 'State:      off (not supervised)\n'
+    fi
+
+    printf 'Run script: %s\n' "$SV_DIR/$name/run"
+    if [[ -f "$SV_DIR/$name/log/run" ]]; then
+        printf 'Log script: %s\n' "$SV_DIR/$name/log/run"
+    fi
+    if [[ -d "$LOG_DIR/$name" ]]; then
+        printf 'Log files:  %s\n' "$LOG_DIR/$name"
+    fi
+    if ! service_enabled "$name"; then
+        note "Enable it with: void svc enable --now $name"
+    else
+        note "Restart with: void svc restart $name"
+    fi
+}
+
+svc_list_static() {
+    local all=${1:-0} link name enabled=0
+    printf '\n%-28s %-8s %-8s %s\n' "SERVICE" "STATE" "ENABLED" "DETAIL"
+    for link in "$SERVICE_DIR"/*; do
+        [[ -e $link || -L $link ]] || continue
+        name=${link##*/}
+        enabled=$((enabled + 1))
+        printf '%-28s %-8s %-8s %s\n' "$name" "?" "yes" "run 'void svc status $name'"
+    done
+    if (( all )); then
+        local dir
+        for dir in "$SV_DIR"/*; do
+            [[ -d $dir ]] || continue
+            name=${dir##*/}
+            service_enabled "$name" && continue
+            printf '%-28s %-8s %-8s %s\n' "$name" "off" "no" "available"
+        done
+    fi
+    if (( enabled == 0 )); then
+        warn "No services are enabled."
+    else
+        note "Live status needs root; run 'void svc list' from a terminal with sudo access."
+    fi
+}
+
+svc_list() {
+    local all=0
+    while (($#)); do
+        case "$1" in
+            -a|--all) all=1 ;;
+            -h|--help) svc_usage; return 0 ;;
+            -*) die "Unknown option for 'void svc list': $1" ;;
+            *) die "void svc list takes no service names." ;;
+        esac
+        shift
+    done
+    require_runit
+
+    local output=""
+    if [[ -d $SERVICE_DIR ]] && compgen -G "$SERVICE_DIR/*" >/dev/null \
+        && { (( EUID == 0 )) || [[ -n $SUDO_CMD ]]; }; then
+        output=$(root_output sv status "$SERVICE_DIR"/* 2>/dev/null) || true
+    fi
+
+    if [[ -z $output ]]; then
+        svc_list_static "$all"
+        return 0
+    fi
+
+    declare -A state=() detail=() logstate=()
+    local line s main pathpart path name
+    while IFS= read -r line; do
+        [[ -z $line ]] && continue
+        s=${line%%:*}
+        main=${line%%;*}
+        pathpart=${main#*: }
+        path=${pathpart%%:*}
+        name=${path##*/}
+        [[ -n $name ]] || continue
+        state[$name]=$s
+        detail[$name]=$(format_sv_detail "${pathpart#*: }" "$s")
+        if [[ $line == *"; "* ]]; then
+            local logpart=${line#*; }
+            logstate[$name]=${logpart%%:*}
+        fi
+    done <<<"$output"
+
+    if (( all )); then
+        local dir
+        for dir in "$SV_DIR"/*; do
+            [[ -d $dir ]] || continue
+            name=${dir##*/}
+            if [[ -z ${state[$name]+x} ]]; then
+                state[$name]=off
+                detail[$name]="available, not enabled"
+            fi
+        done
+    fi
+
+    local -a names=()
+    mapfile -t names < <(printf '%s\n' "${!state[@]}" | sed '/^$/d' | sort)
+    if ((${#names[@]} == 0)); then
+        warn "No services found."
+        return 0
+    fi
+
+    local enabled_count=0 running_count=0 stopped_count=0
+    printf '\n%-28s %-8s %-8s %s\n' "SERVICE" "STATE" "ENABLED" "DETAIL"
+    for name in "${names[@]}"; do
+        s=${state[$name]}
+        local is_enabled=no
+        service_enabled "$name" && is_enabled=yes
+        [[ $s == run ]] && running_count=$((running_count + 1))
+        [[ $s == down || $s == fail ]] && stopped_count=$((stopped_count + 1))
+        [[ $is_enabled == yes ]] && enabled_count=$((enabled_count + 1))
+        printf '%-28s ' "$name"
+        printf '%s%-8s%s ' "$(state_color "$s")" "$s" "$C_RESET"
+        printf '%-8s ' "$is_enabled"
+        if [[ -n ${logstate[$name]:-} && ${logstate[$name]} != run ]]; then
+            printf '%s (log)\n' "${detail[$name]}"
+        else
+            printf '%s\n' "${detail[$name]:--}"
+        fi
+    done
+
+    printf '\n%d enabled • %d running • %d not running\n' \
+        "$enabled_count" "$running_count" "$stopped_count"
+    (( all )) || note "Show every available service with: void svc list --all"
+}
+
+svc_enable() {
+    local now=0
+    local -a names=()
+
+    while (($#)); do
+        case "$1" in
+            --now) now=1 ;;
+            -y|--yes) ASSUME_YES=1 ;;
+            -n|--dry-run) DRY_RUN=1 ;;
+            -h|--help) svc_usage; return 0 ;;
+            -*) die "Unknown option for 'void svc enable': $1" ;;
+            *) names+=("$1") ;;
+        esac
+        shift
+    done
+
+    ((${#names[@]})) || die "Usage: void svc enable [--now] <service...>"
+    require_runit
+
+    local name rc=0
+    for name in "${names[@]}"; do
+        if ! service_exists "$name" && ! (( DRY_RUN )); then
+            err "No such service: '$name'"
+            rc=1
+            continue
+        fi
+        svc_enable_one "$name" || { rc=1; continue; }
+        if (( now )); then
+            wait_for_supervise "$name" || warn "runsvdir is taking a while to notice '$name'."
+            if sv_do_quiet start "$name"; then
+                ok "Started '$name'."
+            else
+                err "Could not start '$name'."
+                note "Check its run script: $SV_DIR/$name/run"
+                rc=1
+            fi
+        fi
+    done
+    return "$rc"
+}
+
+svc_disable() {
+    local -a names=()
+    while (($#)); do
+        case "$1" in
+            -y|--yes) ASSUME_YES=1 ;;
+            -n|--dry-run) DRY_RUN=1 ;;
+            -h|--help) svc_usage; return 0 ;;
+            -*) die "Unknown option for 'void svc disable': $1" ;;
+            *) names+=("$1") ;;
+        esac
+        shift
+    done
+    ((${#names[@]})) || die "Usage: void svc disable <service...>"
+    require_runit
+
+    local name rc=0
+    for name in "${names[@]}"; do
+        svc_disable_one "$name" || rc=1
+    done
+    return "$rc"
+}
+
+svc_simple() {
+    local action=$1
+    shift
+    local -a names=()
+
+    while (($#)); do
+        case "$1" in
+            -y|--yes) ASSUME_YES=1 ;;
+            -n|--dry-run) DRY_RUN=1 ;;
+            -h|--help) svc_usage; return 0 ;;
+            -*) die "Unknown option for 'void svc $action': $1" ;;
+            *) names+=("$1") ;;
+        esac
+        shift
+    done
+    ((${#names[@]})) || die "Usage: void svc $action <service...>"
+    require_runit
+
+    local name rc=0
+    for name in "${names[@]}"; do
+        case "$action" in
+            start) svc_start_one "$name" || rc=1 ;;
+            stop) svc_stop_one "$name" || rc=1 ;;
+            restart) svc_restart_one "$name" || rc=1 ;;
+            reload) svc_reload_one "$name" || rc=1 ;;
+        esac
+    done
+    return "$rc"
+}
+
+svc_status() {
+    (($#)) || { svc_list; return; }
+    local -a names=()
+    while (($#)); do
+        case "$1" in
+            -n|--dry-run) DRY_RUN=1 ;;
+            -h|--help) svc_usage; return 0 ;;
+            -*) die "Unknown option for 'void svc status': $1" ;;
+            *) names+=("$1") ;;
+        esac
+        shift
+    done
+    require_runit
+
+    local name rc=0
+    for name in "${names[@]}"; do
+        svc_status_one "$name" || rc=1
+        ((${#names[@]} > 1)) && printf '\n'
+    done
+    return "$rc"
+}
+
+svc_edit() {
+    local name=${1:-}
+    [[ -n $name ]] || die "Usage: void svc edit <service>"
+    service_exists "$name" || die "No such service: '$name'"
+
+    local file="$SV_DIR/$name/run"
+    local editor=${VISUAL:-${EDITOR:-vi}}
+
+    if (( EUID == 0 )); then
+        run "$editor" "$file"
+    elif have sudoedit; then
+        run sudoedit "$file"
+    else
+        as_root "$editor" "$file"
+    fi
+    note "Apply changes with: void svc restart $name"
+}
+
+svc_create() {
+    local name="" exec_cmd="" run_user="" make_log=1 enable_now=0
+
+    while (($#)); do
+        case "$1" in
+            --exec) shift; exec_cmd=${1:-} ;;
+            --user) shift; run_user=${1:-} ;;
+            --no-log) make_log=0 ;;
+            --enable) enable_now=1 ;;
+            -y|--yes) ASSUME_YES=1 ;;
+            -n|--dry-run) DRY_RUN=1 ;;
+            -h|--help) svc_usage; return 0 ;;
+            -*) die "Unknown option for 'void svc create': $1" ;;
+            *) name=$1 ;;
+        esac
+        shift
+    done
+
+    [[ -n $name ]] || die "Usage: void svc create <name> --exec \"command\""
+    [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "Invalid service name: '$name'"
+    [[ -n $exec_cmd ]] || die "Please provide the command to run with --exec."
+    service_exists "$name" && die "Service '$name' already exists in $SV_DIR."
+    require_runit
+
+    local tmpdir
+    tmpdir=$(mktemp -d) || die "Could not create a temporary directory."
+
+    {
+        printf '#!/bin/sh\n'
+        printf 'exec 2>&1\n'
+        if [[ -n $run_user ]]; then
+            printf 'exec chpst -u %q %s\n' "$run_user" "$exec_cmd"
+        else
+            printf 'exec %s\n' "$exec_cmd"
+        fi
+    } >"$tmpdir/run"
+
+    if (( make_log )); then
+        {
+            printf '#!/bin/sh\n'
+            printf 'exec svlogd -tt %q\n' "$LOG_DIR/$name"
+        } >"$tmpdir/log-run"
+    fi
+
+    as_root install -d -m 0755 "$SV_DIR/$name" || { rm -rf "$tmpdir"; return 1; }
+    as_root install -m 0755 "$tmpdir/run" "$SV_DIR/$name/run" || { rm -rf "$tmpdir"; return 1; }
+
+    if (( make_log )); then
+        as_root install -d -m 0755 "$SV_DIR/$name/log" "$LOG_DIR/$name" || { rm -rf "$tmpdir"; return 1; }
+        as_root install -m 0755 "$tmpdir/log-run" "$SV_DIR/$name/log/run" || { rm -rf "$tmpdir"; return 1; }
+    fi
+    rm -rf "$tmpdir"
+
+    ok "Created service '$name'."
+    note "Run script: $SV_DIR/$name/run"
+    (( make_log )) && note "Logs:       $LOG_DIR/$name"
+
+    if (( enable_now )); then
+        svc_enable --now "$name"
+    elif [[ -t 0 ]] && confirm "Enable and start '$name' now?" y; then
+        svc_enable --now "$name"
+    else
+        note "Enable it later with: void svc enable --now $name"
+    fi
+}
+
+cmd_svc() {
+    local sub=${1:-help}
+    (($#)) && shift
+
+    case "$sub" in
+        list|ls) svc_list "$@" ;;
+        status|st) svc_status "$@" ;;
+        start) svc_simple start "$@" ;;
+        stop) svc_simple stop "$@" ;;
+        restart) svc_simple restart "$@" ;;
+        reload) svc_simple reload "$@" ;;
+        enable|on) svc_enable "$@" ;;
+        disable|off) svc_disable "$@" ;;
+        edit) svc_edit "$@" ;;
+        create|new) svc_create "$@" ;;
+        logs|log) logs_cmd "$@" ;;
+        help|-h|--help) svc_usage ;;
+        *) die "Unknown service command: '$sub'. Run 'void svc help'." ;;
+    esac
+}
+
+# --- Logs ------------------------------------------------------------
+
+logs_find_file() {
+    local name=$1 file=""
+
+    if [[ -f $name ]]; then
+        printf '%s\n' "$name"
+        return 0
+    fi
+
+    if [[ -f "$LOG_DIR/$name/current" ]]; then
+        printf '%s\n' "$LOG_DIR/$name/current"
+        return 0
+    fi
+    if [[ -f "$LOG_DIR/$name.log" ]]; then
+        printf '%s\n' "$LOG_DIR/$name.log"
+        return 0
+    fi
+
+    local log_run="$SV_DIR/$name/log/run"
+    if [[ -f $log_run ]]; then
+        local dir
+        dir=$(grep -oE '/(var|home|srv|tmp)/log/[A-Za-z0-9._/-]+' "$log_run" 2>/dev/null | head -n1)
+        if [[ -n $dir && -f "$dir/current" ]]; then
+            printf '%s\n' "$dir/current"
+            return 0
+        fi
+    fi
+
+    printf '%s\n' "$file"
+}
+
+logs_list() {
+    local found=0 file
+    info "Log files in $LOG_DIR:"
+    while IFS= read -r file; do
+        [[ -n $file ]] || continue
+        found=1
+        printf '  %s\n' "$file"
+    done < <(find "$LOG_DIR" -maxdepth 3 -type f \( -name current -o -name '*.log' \) 2>/dev/null | sort)
+    (( found )) || printf '  (none found)\n'
+
+    printf '\nServices with a log script:\n'
+    found=0
+    if compgen -G "$SV_DIR/*/log/run" >/dev/null; then
+        local log_run name
+        for log_run in "$SV_DIR"/*/log/run; do
+            [[ -f $log_run ]] || continue
+            name=${log_run%/log/run}
+            name=${name##*/}
+            found=1
+            printf '  %s\n' "$name"
+        done
+    fi
+    (( found )) || printf '  (none found)\n'
+}
+
+logs_cmd() {
+    local follow=0 lines=50 name="" list=0
+
+    while (($#)); do
+        case "$1" in
+            -f|--follow) follow=1 ;;
+            -n|--lines)
+                shift
+                [[ ${1:-} =~ ^[0-9]+$ ]] || die "-n/--lines needs a number."
+                lines=$1
+                ;;
+            --list) list=1 ;;
+            -h|--help) logs_usage; return 0 ;;
+            -*) die "Unknown option for 'void logs': $1" ;;
+            *)
+                [[ -z $name ]] || die "Please specify a single service or log file."
+                name=$1
+                ;;
+        esac
+        shift
+    done
+
+    if (( list )) || [[ -z $name ]]; then
+        logs_list
+        return 0
+    fi
+
+    local file
+    file=$(logs_find_file "$name")
+
+    if [[ -z $file ]]; then
+        err "No log file found for '$name'."
+        if [[ -f "$SV_DIR/$name/log/run" ]]; then
+            note "Log script: $SV_DIR/$name/log/run"
+            note "This service may log through syslog/vlogger instead of a file."
+        else
+            note "Try 'void logs --list', or check the service's run script."
+        fi
+        return 1
+    fi
+
+    local -a args=(-n "$lines")
+    (( follow )) && args+=(-F)
+
+    info "Showing $file"
+    if [[ -r $file ]]; then
+        run tail "${args[@]}" "$file"
+    else
+        as_root tail "${args[@]}" "$file"
+    fi
+}
+
+# --- Repository commands ---------------------------------------------
+
+# The catalog of third-party XBPS repositories that can be added by name.
+#
+# Field layout: name|url|description|homepage|arches|priority|conflicts
+#   url        {{arch}} is replaced with the local xbps architecture
+#   arches     "any", or a space separated allow-list of supported arches
+#   priority   config filename prefix; files are read in filename order and
+#              the first match wins, so a lower prefix means higher priority
+#   conflicts  space separated catalog names that must not be enabled at the
+#              same time, because they publish the same packages
+#
+# Priority stays at 20 for third-party repos so the official Void repositories
+# keep winning on shared package names.
+#
+# Every entry below was checked by fetching <url>/<arch>-repodata and
+# confirming an XBPS index came back.
+repo_catalog() {
+    cat <<'CATALOG'
+blackhole|https://mirror.black-hole.dev/{{arch}}|Community packages: Hyprland, Wayland extras, and more|https://www.black-hole.dev/|any|20|blackhole-ru hyprland
+blackhole-ru|https://ru.mirror.black-hole.dev/{{arch}}|BlackHole mirror hosted in Russia|https://www.black-hole.dev/|any|20|blackhole hyprland
+hyprland|https://raw.githubusercontent.com/sofijacom/hyprland-void/repository-{{arch}}-glibc|Rolling Hyprland builds, glibc only|https://github.com/sofijacom/hyprland-void|x86_64|20|blackhole blackhole-ru
+librewolf|https://github.com/index-0/librewolf-void/releases/latest/download|LibreWolf browser builds|https://github.com/index-0/librewolf-void|any|20
+noid|https://github.com/noid-linux/xbps-repo/releases/latest/download|Noid Linux custom packages|https://github.com/noid-linux/xbps-repo|any|20
+sonicde|https://github.com/sonicde-void/sonicde-void/releases/latest/download|SonicDE desktop packages|https://github.com/sonicde-void/sonicde-void|any|20
+kennel|https://github.com/Kennel-Linux/nwg/releases/latest/download|nwg-shell and Kennel-Linux packages|https://github.com/Kennel-Linux/nwg|any|20
+xlibre|https://github.com/xlibre-void/xlibre/releases/latest/download|XLibre X11 server packages|https://github.com/xlibre-void/xlibre|any|20
+linuxnauta|https://voidrepo.linuxnauta.com|LinuxNauta personal package repo|https://voidrepo.linuxnauta.com|any|20
+voiders|https://repo.voiders.dev|voiders.dev community packages|https://voiders.dev|any|20
+neko|https://sourceforge.net/projects/neko-void/files/repo|Neko Void repository|https://sourceforge.net/projects/neko-void/|any|20
+lazy|https://github.com/lazylinuxos/lazy-repo/releases/latest/download|Lazy Linux repository|https://github.com/lazylinuxos/lazy-repo|any|20
+grvn|https://github.com/grvn/void-packages/releases/latest/download|grvn's personal package builds|https://github.com/grvn/void-packages|any|20
+vup-utilities|https://github.com/VUP-Linux/vup/releases/download/utilities-x86_64-current|VUP: utilities|https://github.com/VUP-Linux/vup|any|20
+vup-productivity|https://github.com/VUP-Linux/vup/releases/download/productivity-x86_64-current|VUP: productivity|https://github.com/VUP-Linux/vup|any|20
+vup-browsers|https://github.com/VUP-Linux/vup/releases/download/browsers-x86_64-current|VUP: browsers|https://github.com/VUP-Linux/vup|any|20
+vup-communication|https://github.com/VUP-Linux/vup/releases/download/communication-x86_64-current|VUP: communication|https://github.com/VUP-Linux/vup|any|20
+vup-emulators|https://github.com/VUP-Linux/vup/releases/download/emulators-x86_64-current|VUP: emulators|https://github.com/VUP-Linux/vup|any|20
+vup-education|https://github.com/VUP-Linux/vup/releases/download/education-x86_64-current|VUP: education|https://github.com/VUP-Linux/vup|any|20
+vup-networking|https://github.com/VUP-Linux/vup/releases/download/networking-x86_64-current|VUP: networking|https://github.com/VUP-Linux/vup|any|20
+vup-languages|https://github.com/VUP-Linux/vup/releases/download/languages-x86_64-current|VUP: languages|https://github.com/VUP-Linux/vup|any|20
+vup-language-servers|https://github.com/VUP-Linux/vup/releases/download/language-servers-x86_64-current|VUP: language servers|https://github.com/VUP-Linux/vup|any|20
+vup-runtime-managers|https://github.com/VUP-Linux/vup/releases/download/language-runtime-managers-x86_64-current|VUP: language runtime managers|https://github.com/VUP-Linux/vup|any|20
+CATALOG
+}
+
+repo_arch() {
+    local arch=""
+    if have xbps-uhelper; then
+        arch=$(xbps-uhelper arch 2>/dev/null || true)
+    fi
+    printf '%s\n' "${arch:-x86_64}"
+}
+
+repo_catalog_entry() {
+    local want=$1 name url desc home arches prio conflicts
+    [[ -n $want ]] || return 1
+    while IFS='|' read -r name url desc home arches prio conflicts; do
+        [[ -n $name ]] || continue
+        [[ $name == "$want" ]] || continue
+        printf '%s|%s|%s|%s|%s|%s|%s\n' \
+            "$name" "$url" "$desc" "$home" "$arches" "$prio" "$conflicts"
+        return 0
+    done < <(repo_catalog)
+    return 1
+}
+
+# Catalog names that clash with NAME.
+repo_conflicts_of() {
+    local want=$1 name url desc home arches prio conflicts
+    while IFS='|' read -r name url desc home arches prio conflicts; do
+        [[ $name == "$want" ]] || continue
+        tr ' ' '\n' <<<"$conflicts" | sed '/^$/d'
+    done < <(repo_catalog)
+}
+
+# Reverse lookup: normalized URL to catalog name.
+repo_name_for_url() {
+    local want=$1 name url desc home arches prio conflicts arch
+    arch=$(repo_arch)
+    while IFS='|' read -r name url desc home arches prio conflicts; do
+        [[ -n $name ]] || continue
+        url=$(repo_norm_url "${url//"{{arch}}"/$arch}")
+        [[ $url == "$want" ]] && { printf '%s\n' "$name"; return 0; }
+    done < <(repo_catalog)
+    return 1
+}
+
+# Enabled repos that clash with each other, two names per pair.
+# Returns 0 if there is at least one.
+repo_active_conflicts() {
+    local configured url name other
+    configured=$(repo_configured_urls)
+    local -A names=()
+    while IFS= read -r url; do
+        [[ -n $url ]] || continue
+        name=$(repo_name_for_url "$url") || continue
+        names[$name]=$url
+    done <<<"$configured"
+
+    local -a pairs=()
+    local -A printed=()
+    for name in "${!names[@]}"; do
+        while IFS= read -r other; do
+            [[ -n $other ]] || continue
+            [[ -n ${names[$other]:-} ]] || continue
+            if [[ -n ${printed["$name:$other"]:-} || -n ${printed["$other:$name"]:-} ]]; then
+                continue
+            fi
+            printed["$name:$other"]=1
+            pairs+=("$name" "$other")
+        done < <(repo_conflicts_of "$name")
+    done
+
+    ((${#pairs[@]})) || return 1
+    printf '%s\n' "${pairs[@]}" | sort
+    return 0
+}
+
+repo_arch_supported() {
+    local arches=$1 arch=$2 candidate
+    [[ $arches == any ]] && return 0
+    for candidate in $arches; do
+        [[ $candidate == "$arch" ]] && return 0
+    done
+    return 1
+}
+
+repo_guess_name() {
+    local name=${1#*://}
+    name=${name%%/*}
+    name=${name%%:*}
+    name=${name//[^A-Za-z0-9._-]/-}
+    printf '%s\n' "$name"
+}
+
+# Every repository= line in the active config dir.
+repo_configured_urls() {
+    local config
+    for config in "$XBPS_CONF_DIR"/*.conf; do
+        [[ -e $config ]] || continue
+        sed -n 's/^[[:space:]]*repository[[:space:]]*=[[:space:]]*//p' "$config" 2>/dev/null
+    done | repo_norm_urls
+}
+
+# Trailing slashes mean nothing to xbps; drop them before comparing.
+repo_norm_urls() {
+    local line
+    while IFS= read -r line; do
+        [[ -n $line ]] || continue
+        printf '%s\n' "$(repo_norm_url "$line")"
+    done
+}
+
+repo_norm_url() {
+    local url=$1
+    while [[ $url == */ ]]; do
+        url=${url%/}
+    done
+    printf '%s\n' "$url"
+}
+
+repo_is_configured() {
+    local needle configured
+    needle=$(repo_norm_url "$1")
+    configured=$(repo_configured_urls)
+    [[ $'\n'"$configured"$'\n' == *$'\n'"$needle"$'\n'* ]]
+}
+
+# Resolve a repository name, catalog name, config filename, or filename stem
+# to a real config file. Catalog names resolve through the URL they publish,
+# because the file on disk may well be named after something else entirely.
+repo_config_path() {
+    local target=$1 base file candidate entry strict_url=""
+    base=${target##*/}
+    [[ -n $base ]] || return 1
+
+    if entry=$(repo_catalog_entry "$target" 2>/dev/null); then
+        local name url desc home arches prio conflicts arch want
+        IFS='|' read -r name url desc home arches prio conflicts <<<"$entry"
+        arch=$(repo_arch)
+        want=$(repo_norm_url "${url//"{{arch}}"/$arch}")
+        for candidate in "$XBPS_CONF_DIR"/*.conf "$XBPS_CONF_DIR"/*.conf.disabled; do
+            [[ -e $candidate ]] || continue
+            local got
+            got=$(sed -n 's/^[[:space:]]*repository[[:space:]]*=[[:space:]]*//p' \
+                "$candidate" 2>/dev/null | head -n1)
+            [[ -n $got ]] || continue
+            [[ $(repo_norm_url "$got") == "$want" ]] || continue
+            printf '%s\n' "$candidate"
+            return 0
+        done
+        # The catalog knows this repository, and no config points at it. Fall
+        # through to filename matching only for a file that carries the same
+        # URL, so "hyprland" cannot resolve to a BlackHole config.
+        strict_url=$want
+    fi
+
+    file="$XBPS_CONF_DIR/$base"
+    [[ $base == *.conf || $base == *.conf.disabled ]] || file="$file.conf"
+    if [[ -e $file ]]; then
+        printf '%s\n' "$file"
+        return 0
+    fi
+
+    # Last resort: match the filename. An exact stem beats a substring, so
+    # "hyprland" never picks up "20-serpantinum-hyprland.conf".
+    local stem
+    local -a exact=() loose=()
+    for candidate in "$XBPS_CONF_DIR"/*"${base%.conf}"*.conf \
+                     "$XBPS_CONF_DIR"/*"${base%.conf}"*.conf.disabled; do
+        [[ -e $candidate ]] || continue
+        if [[ -n $strict_url ]]; then
+            local got
+            got=$(sed -n 's/^[[:space:]]*repository[[:space:]]*=[[:space:]]*//p' \
+                "$candidate" 2>/dev/null | head -n1)
+            [[ -n $got && $(repo_norm_url "$got") == "$strict_url" ]] || continue
+        fi
+        stem=${candidate##*/}
+        stem=${stem%%.conf*}
+        stem=${stem#*-}
+        if [[ $stem == "${base%.conf}" ]]; then
+            exact+=("$candidate")
+        else
+            loose+=("$candidate")
+        fi
+    done
+    if ((${#exact[@]})); then
+        printf '%s\n' "${exact[0]}"
+        return 0
+    fi
+    if ((${#loose[@]})); then
+        printf '%s\n' "${loose[0]}"
+        return 0
+    fi
+    return 1
+}
+
+repo_list() {
+    require_xbps
+    printf '%sRepository configuration files:%s  (%s)\n' "$C_BOLD" "$C_RESET" "$XBPS_CONF_DIR"
+    local found=0 config
+    if compgen -G "$XBPS_CONF_DIR/*.conf" >/dev/null; then
+        for config in "$XBPS_CONF_DIR"/*.conf; do
+            found=1
+            printf '  %s\n' "${config##*/}"
+            sed -n 's/^[[:space:]]*repository[[:space:]]*=[[:space:]]*/    /p' "$config" 2>/dev/null
+        done
+    fi
+    (( found )) || printf '  (none)\n'
+
+    if compgen -G "$XBPS_CONF_DIR/*.conf.disabled" >/dev/null; then
+        printf '\n%sDisabled:%s\n' "$C_BOLD" "$C_RESET"
+        for config in "$XBPS_CONF_DIR"/*.conf.disabled; do
+            printf '  %s\n' "${config##*/}"
+        done
+    fi
+
+    printf '\n%sActive repositories:%s\n' "$C_BOLD" "$C_RESET"
+    xbps-query -L 2>/dev/null || warn "Could not list repositories."
+
+    local conflicts
+    if conflicts=$(repo_active_conflicts); then
+        printf '\n%sConflicting repositories:%s\n' "$C_BOLD" "$C_RESET"
+        while IFS= read -r config; do
+            printf '  %s\n' "$config"
+        done <<<"$conflicts"
+        note "These publish the same packages; keep only one."
+    fi
+
+    printf '\n%sMore repositories:%s void pkg repo available\n' "$C_DIM" "$C_RESET"
+}
+
+repo_available() {
+    local term=${1:-} name url desc home arches prio conflicts status arch configured other
+    arch=$(repo_arch)
+    configured=$(repo_configured_urls)
+
+    printf '%s%-24s %-9s %s%s\n' "$C_BOLD" "NAME" "STATUS" "DESCRIPTION" "$C_RESET"
+    while IFS='|' read -r name url desc home arches prio conflicts; do
+        [[ -n $name ]] || continue
+        if [[ -n $term ]]; then
+            case "${name} ${desc}" in
+                *"$term"*) ;;
+                *) continue ;;
+            esac
+        fi
+
+        url=$(repo_norm_url "${url//"{{arch}}"/$arch}")
+        if ! repo_arch_supported "$arches" "$arch"; then
+            status="noarch"
+        elif [[ $'\n'"$configured"$'\n' == *$'\n'"$url"$'\n'* ]]; then
+            status="added"
+        else
+            status="-"
+        fi
+        printf '%-24s %-9s %s\n' "$name" "$status" "$desc"
+    done < <(repo_catalog)
+
+    printf '\n%sAdd a repository:%s void pkg repo add <name>\n' "$C_DIM" "$C_RESET"
+    printf '%sInspect one:%s     void pkg repo info <name>\n' "$C_DIM" "$C_RESET"
+}
+
+repo_info() {
+    local name=${1:-} entry url desc home arches prio conflicts arch other active=()
+    [[ -n $name ]] || die "Usage: void pkg repo info <name>"
+    entry=$(repo_catalog_entry "$name") \
+        || die "Unknown repository '$name'. Run 'void pkg repo available'."
+    IFS='|' read -r name url desc home arches prio conflicts <<<"$entry"
+
+    arch=$(repo_arch)
+    url=${url//"{{arch}}"/$arch}
+
+    printf '%s%s%s\n' "$C_BOLD" "$name" "$C_RESET"
+    printf '  %-14s %s\n' "Description" "$desc"
+    printf '  %-14s %s\n' "Homepage" "$home"
+    printf '  %-14s %s\n' "Repository" "$url"
+    local config
+    config=$(repo_config_path "$name" 2>/dev/null) \
+        || config="$XBPS_CONF_DIR/$prio-$name.conf"
+    printf '  %-14s %s\n' "Config file" "$config"
+    printf '  %-14s %s\n' "File contains" \
+        "$(sed -n 's/^[[:space:]]*repository[[:space:]]*=[[:space:]]*//p' \
+            "$config" 2>/dev/null || printf '(not created)')"
+    if repo_arch_supported "$arches" "$arch"; then
+        printf '  %-14s yes (%s)\n' "Supported" "$arch"
+    else
+        printf '  %-14s no, wants: %s\n' "Supported" "$arches"
+    fi
+    if repo_is_configured "$url"; then
+        printf '  %-14s yes\n' "Configured"
+    else
+        printf '  %-14s no\n' "Configured"
+    fi
+
+    if [[ -n $conflicts ]]; then
+        printf '  %-14s %s\n' "Conflicts with" "$conflicts"
+        while IFS= read -r other; do
+            [[ -n $other ]] || continue
+            local oentry ourl="" odesc ohome oarches oprio oconf
+            oentry=$(repo_catalog_entry "$other") || continue
+            IFS='|' read -r other ourl odesc ohome oarches oprio oconf <<<"$oentry"
+            ourl=${ourl//"{{arch}}"/$arch}
+            if repo_is_configured "$ourl"; then
+                active+=("$other")
+            fi
+        done < <(tr ' ' '\n' <<<"$conflicts")
+        if ((${#active[@]})); then
+            printf '  %-14s %s\n' "Enabled now" \
+                "yes (${active[*]}), remove one: void pkg repo remove ${active[0]}"
+        fi
+    fi
+}
+
+repo_add() {
+    local target="" name="" url="" prio="" arches="" conflicts="" entry
+    while (($#)); do
+        case "$1" in
+            --name) shift; name=${1:-} ;;
+            -y|--yes) ASSUME_YES=1 ;;
+            -n|--dry-run) DRY_RUN=1 ;;
+            -h|--help) repo_usage; return 0 ;;
+            -*) die "Unknown option for 'void pkg repo add': $1" ;;
+            *) target=$1 ;;
+        esac
+        shift
+    done
+
+    [[ -n $target ]] || die "Usage: void pkg repo add <name|url> [--name NAME]"
+    require_xbps
+
+    local arch
+    arch=$(repo_arch)
+
+    if entry=$(repo_catalog_entry "$target"); then
+        IFS='|' read -r name url desc home arches prio conflicts <<<"$entry"
+        repo_arch_supported "$arches" "$arch" \
+            || die "Repository '$name' does not publish packages for '$arch'."
+        url=${url//"{{arch}}"/$arch}
+    elif [[ $target =~ ^https?://[^[:space:]]+$ ]]; then
+        url=$target
+        prio=10
+        [[ -n $name ]] || name=$(repo_guess_name "$url")
+    else
+        die "Unknown repository '$target'. Run 'void pkg repo available' to see known names."
+    fi
+
+    [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "Invalid repository name: '$name'"
+
+    if repo_is_configured "$url"; then
+        die "That repository is already configured: $url"
+    fi
+
+    # Two repositories that publish the same packages cannot both be enabled:
+    # xbps resolves a name from whichever repo it reads first, so the loser is
+    # silently invisible and its versions never get used.
+    local other oentry ourl="" odesc ohome oarches oprio oconf active=()
+    while IFS= read -r other; do
+        [[ -n $other ]] || continue
+        oentry=$(repo_catalog_entry "$other") || continue
+        IFS='|' read -r other ourl odesc ohome oarches oprio oconf <<<"$oentry"
+        ourl=${ourl//"{{arch}}"/$arch}
+        repo_is_configured "$ourl" && active+=("$other")
+    done < <(tr ' ' '\n' <<<"$conflicts")
+
+    if ((${#active[@]})); then
+        err "'$name' conflicts with ${active[*]}, which is already configured."
+        note "They publish overlapping packages, so only the first one is used."
+        note "Remove it first: void pkg repo remove ${active[0]}"
+        return 1
+    fi
+
+    local file="$XBPS_CONF_DIR/$prio-$name.conf"
+    [[ -e $file ]] && die "Repository config already exists: $file"
+
+    # BlackHole used to ship a GitHub-hosted repo under this name. The current
+    # mirror replaces it, and the two must not be enabled at once.
+    if [[ $name == blackhole* && -e "$XBPS_CONF_DIR/20-repository-extra.conf" ]]; then
+        warn "Deprecated BlackHole config found: $XBPS_CONF_DIR/20-repository-extra.conf"
+        if (( DRY_RUN )) || confirm "Remove the deprecated config?" y; then
+            as_root rm -f "$XBPS_CONF_DIR/20-repository-extra.conf" \
+                && ok "Removed the deprecated BlackHole config."
+        else
+            die "Remove $XBPS_CONF_DIR/20-repository-extra.conf before adding BlackHole."
+        fi
+    fi
+
+    local tmp
+    tmp=$(mktemp) || die "Could not create a temporary file."
+    printf 'repository=%s\n' "$url" >"$tmp"
+
+    info "Adding repository '$name' ($url)."
+    if as_root install -m 0644 "$tmp" "$file"; then
+        rm -f "$tmp"
+        ok "Wrote $file"
+        note "Refresh indexes with: void pkg repo refresh"
+    else
+        rm -f "$tmp"
+        err "Could not write $file"
+        return 1
+    fi
+}
+
+repo_remove() {
+    local target=""
+    while (($#)); do
+        case "$1" in
+            -y|--yes) ASSUME_YES=1 ;;
+            -n|--dry-run) DRY_RUN=1 ;;
+            -h|--help) repo_usage; return 0 ;;
+            -*) die "Unknown option for 'void pkg repo remove': $1" ;;
+            *) target=$1 ;;
+        esac
+        shift
+    done
+    [[ -n $target ]] || die "Usage: void pkg repo remove <name|file>"
+
+    local file
+    file=$(repo_config_path "$target") || die "No such repository config: $target"
+
+    if ! (( DRY_RUN )); then
+        confirm "Remove repository config '${file##*/}'?" n || return 1
+    fi
+    as_root rm -f "$file" || return 1
+    ok "Removed $file"
+    note "Refresh indexes with: void pkg repo refresh"
+}
+
+repo_disable() {
+    local target=""
+    while (($#)); do
+        case "$1" in
+            -y|--yes) ASSUME_YES=1 ;;
+            -n|--dry-run) DRY_RUN=1 ;;
+            -h|--help) repo_usage; return 0 ;;
+            -*) die "Unknown option for 'void pkg repo disable': $1" ;;
+            *) target=$1 ;;
+        esac
+        shift
+    done
+    [[ -n $target ]] || die "Usage: void pkg repo disable <name|file>"
+
+    local file
+    file=$(repo_config_path "$target") || die "No such repository config: $target"
+    [[ $file == *.disabled ]] && die "Already disabled: $file"
+
+    (( DRY_RUN )) || confirm "Disable repository config '${file##*/}'?" y || return 1
+    as_root mv -- "$file" "$file.disabled" || return 1
+    ok "Disabled ${file##*/}"
+    note "Re-enable with: void pkg repo enable ${file##*/}"
+}
+
+repo_enable() {
+    local target=""
+    while (($#)); do
+        case "$1" in
+            -y|--yes) ASSUME_YES=1 ;;
+            -n|--dry-run) DRY_RUN=1 ;;
+            -h|--help) repo_usage; return 0 ;;
+            -*) die "Unknown option for 'void pkg repo enable': $1" ;;
+            *) target=$1 ;;
+        esac
+        shift
+    done
+    [[ -n $target ]] || die "Usage: void pkg repo enable <name|file>"
+
+    local file
+    file=$(repo_config_path "$target") || die "No such repository config: $target"
+    [[ $file == *.disabled ]] || die "Not disabled: $file"
+
+    local dest=${file%.disabled}
+    [[ -e $dest ]] && die "A config already exists at $dest"
+
+    as_root mv -- "$file" "$dest" || return 1
+    ok "Enabled ${dest##*/}"
+    note "Refresh indexes with: void pkg repo refresh"
+}
+
+repo_refresh() {
+    require_xbps
+    info "Refreshing repository indexes"
+    as_root xbps-install -S "$@" || die "Could not refresh repository indexes."
+    ok "Repository indexes refreshed."
+}
+
+cmd_pkg_repo() {
+    local sub=${1:-list}
+    (($#)) && shift
+    case "$sub" in
+        list|ls|status) repo_list "$@" ;;
+        available|search|catalog|find) repo_available "$@" ;;
+        info|show) repo_info "$@" ;;
+        add) repo_add "$@" ;;
+        remove|rm|del) repo_remove "$@" ;;
+        disable) repo_disable "$@" ;;
+        enable) repo_enable "$@" ;;
+        refresh|sync|update) repo_refresh "$@" ;;
+        help|-h|--help) repo_usage ;;
+        *) die "Unknown repository command: '$sub'. Run 'void pkg repo help'." ;;
+    esac
+}
+
+cmd_repo() {
+    cmd_pkg_repo "$@"
+}
+
+# --- Desktop caches --------------------------------------------------
+
+desktop_refresh() {
+    local user_only=0 icons=1 mime=1
+
+    while (($#)); do
+        case "$1" in
+            --user) user_only=1 ;;
+            --no-icons) icons=0 ;;
+            --no-mime) mime=0 ;;
+            -n|--dry-run) DRY_RUN=1 ;;
+            -h|--help) desktop_usage; return 0 ;;
+            *) die "Unknown option for 'void desktop refresh': $1" ;;
+        esac
+        shift
+    done
+
+    local -a app_dirs=() mime_dirs=() icon_dirs=()
+    local dir
+    if (( user_only )); then
+        app_dirs=("$HOME/.local/share/applications")
+        mime_dirs=("$HOME/.local/share/mime")
+        for dir in "$HOME/.local/share/icons"/*; do
+            [[ -f $dir/index.theme ]] && icon_dirs+=("$dir")
+        done
+    else
+        app_dirs=("/usr/share/applications")
+        mime_dirs=("/usr/share/mime")
+        for dir in /usr/share/icons/*; do
+            [[ -f $dir/index.theme ]] && icon_dirs+=("$dir")
+        done
+    fi
+
+    local refreshed=0
+
+    info "Refreshing desktop entry database"
+    for dir in "${app_dirs[@]}"; do
+        [[ -d $dir ]] || continue
+        if ! have update-desktop-database; then
+            warn "update-desktop-database is missing; install desktop-file-utils."
+            break
+        fi
+        if (( user_only )); then
+            run update-desktop-database "$dir" || return 1
+        else
+            as_root update-desktop-database "$dir" || return 1
+        fi
+        refreshed=$((refreshed + 1))
+    done
+
+    if (( mime )); then
+        info "Refreshing MIME database"
+        for dir in "${mime_dirs[@]}"; do
+            [[ -d $dir ]] || continue
+            if ! have update-mime-database; then
+                warn "update-mime-database is missing; install shared-mime-info."
+                break
+            fi
+            if (( user_only )); then
+                run update-mime-database "$dir" || return 1
+            else
+                as_root update-mime-database "$dir" || return 1
+            fi
+            refreshed=$((refreshed + 1))
+        done
+    fi
+
+    if (( icons )); then
+        info "Refreshing icon caches"
+        if ! have gtk-update-icon-cache; then
+            warn "gtk-update-icon-cache is missing; install gtk+3 or gtk4."
+        else
+            for dir in "${icon_dirs[@]}"; do
+                if (( user_only )); then
+                    run gtk-update-icon-cache -f -t "$dir" || return 1
+                else
+                    as_root gtk-update-icon-cache -f -t "$dir" || return 1
+                fi
+                refreshed=$((refreshed + 1))
+            done
+        fi
+    fi
+
+    if (( refreshed == 0 )); then
+        warn "Nothing to refresh."
+        return 1
+    fi
+    ok "Desktop caches refreshed."
+}
+
+cmd_desktop() {
+    local sub=${1:-help}
+    (($#)) && shift
+    case "$sub" in
+        refresh|update|rebuild) desktop_refresh "$@" ;;
+        help|-h|--help) desktop_usage ;;
+        *) die "Unknown desktop command: '$sub'. Run 'void desktop help'." ;;
+    esac
+}
+
+# --- System information ----------------------------------------------
+
+cmd_info() {
+    local os kernel arch libc init uptime memory disk
+    local pkg_total pkg_manual pkg_orphans repo_count svc_count
+
+    os=$(grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"')
+    [[ -n $os ]] || os="Void Linux"
+    kernel=$(uname -r)
+    arch=$(uname -m)
+    if compgen -G '/lib/ld-musl-*.so.1' >/dev/null; then
+        libc=musl
+    else
+        libc=glibc
+    fi
+    init=$(ps -p 1 -o comm= 2>/dev/null | tr -d ' ')
+    [[ -n $init ]] || init=unknown
+    uptime=$(format_duration "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)")
+
+    local mem_total mem_avail mem_used mem_pct
+    mem_total=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    mem_avail=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    mem_used=$((mem_total - mem_avail))
+    if (( mem_total > 0 )); then
+        mem_pct=$((mem_used * 100 / mem_total))
+    else
+        mem_pct=0
+    fi
+    memory=$(awk -v u="$mem_used" -v t="$mem_total" -v p="$mem_pct" \
+        'BEGIN { printf "%.1f GiB used / %.1f GiB (%d%%)", u/1048576, t/1048576, p }')
+
+    disk=$(df -h / 2>/dev/null | awk 'NR==2 {print $3 " used / " $2 " (" $5 ")"}')
+    [[ -n $disk ]] || disk="unknown"
+
+    pkg_total=$(xbps-query -l 2>/dev/null | wc -l | tr -d ' ')
+    pkg_manual=$(xbps-query -m 2>/dev/null | wc -l | tr -d ' ')
+    pkg_orphans=$(xbps-query -O 2>/dev/null | wc -l | tr -d ' ')
+    repo_count=$(xbps-query -L 2>/dev/null | wc -l | tr -d ' ')
+
+    svc_count=0
+    local link
+    if [[ -d $SERVICE_DIR ]]; then
+        for link in "$SERVICE_DIR"/*; do
+            [[ -e $link || -L $link ]] && svc_count=$((svc_count + 1))
+        done
+    fi
+
+    printf '\n%s  Void Linux%s\n' "$C_BOLD" "$C_RESET"
+    printf '%s  ───────────%s\n' "$C_DIM" "$C_RESET"
+    printf '  %-10s %s\n' "OS" "$os"
+    printf '  %-10s %s\n' "Kernel" "$kernel"
+    printf '  %-10s %s\n' "Arch" "$arch"
+    printf '  %-10s %s\n' "Libc" "$libc"
+    printf '  %-10s %s (PID 1)\n' "Init" "$init"
+    printf '  %-10s %s\n' "Uptime" "$uptime"
+    printf '  %-10s %s\n' "Memory" "$memory"
+    printf '  %-10s %s\n' "Disk /" "$disk"
+    printf '\n'
+    printf '  %-10s %s installed, %s manual, %s orphan(s)\n' "Packages" "$pkg_total" "$pkg_manual" "$pkg_orphans"
+    printf '  %-10s %s enabled\n' "Services" "$svc_count"
+    printf '  %-10s %s configured\n' "Repos" "$repo_count"
+
+    printf '\n'
+    note "New here? Run 'void cheat' for systemd translations and 'void doctor' for a check-up."
+}
+
+# --- Doctor ----------------------------------------------------------
+
+DOCTOR_WARNINGS=0
+DOCTOR_FAILURES=0
+
+check_ok() {
+    printf '%s[ok]%s %s\n' "$C_GREEN" "$C_RESET" "$*"
+}
+
+check_warn() {
+    DOCTOR_WARNINGS=$((DOCTOR_WARNINGS + 1))
+    printf '%s[!!]%s %s\n' "$C_YELLOW" "$C_RESET" "$*"
+}
+
+check_fail() {
+    DOCTOR_FAILURES=$((DOCTOR_FAILURES + 1))
+    printf '%s[xx]%s %s\n' "$C_RED" "$C_RESET" "$*"
+}
+
+cmd_doctor() {
+    local network_service="" svc
+    printf '\n%sVoid health check%s\n\n' "$C_BOLD" "$C_RESET"
+
+    if is_void; then
+        check_ok "Running Void Linux."
+    else
+        check_fail "This does not look like Void Linux (/etc/os-release has no ID=void)."
+    fi
+
+    local missing=() tool
+    for tool in xbps-install xbps-remove xbps-query; do
+        have "$tool" || missing+=("$tool")
+    done
+    if ((${#missing[@]} == 0)); then
+        check_ok "XBPS tools are available."
+    else
+        check_fail "Missing XBPS tools: ${missing[*]}"
+    fi
+
+    if have sv && [[ -d $SERVICE_DIR ]]; then
+        check_ok "runit is available and $SERVICE_DIR exists."
+    else
+        check_fail "runit or $SERVICE_DIR is missing."
+    fi
+
+    local broken=0 svc_count=0 link
+    if [[ -d $SERVICE_DIR ]]; then
+        for link in "$SERVICE_DIR"/*; do
+            [[ -L $link ]] || continue
+            svc_count=$((svc_count + 1))
+            if [[ ! -e $link ]]; then
+                broken=$((broken + 1))
+                check_fail "Broken service symlink: $link"
+            fi
+        done
+    fi
+    if (( broken == 0 )); then
+        check_ok "No broken service symlinks ($svc_count enabled)."
+    fi
+
+    if service_enabled dbus; then
+        check_ok "dbus is enabled."
+    else
+        check_warn "dbus is not enabled; many desktop applications need it."
+    fi
+
+    for svc in NetworkManager dhcpcd wpa_supplicant iwd connmand; do
+        if service_enabled "$svc"; then
+            network_service=$svc
+            break
+        fi
+    done
+    if [[ -n $network_service ]]; then
+        check_ok "Network service enabled: $network_service."
+    else
+        check_warn "No common network service is enabled (NetworkManager, dhcpcd, wpa_supplicant, iwd, connmand)."
+    fi
+
+    local orphans orphan_count
+    orphans=$(xbps-query -O 2>/dev/null || true)
+    orphan_count=0
+    [[ -n $orphans ]] && orphan_count=$(printf '%s\n' "$orphans" | wc -l)
+    if (( orphan_count == 0 )); then
+        check_ok "No orphan packages."
+    else
+        check_warn "$orphan_count orphan package(s); clean up with 'void pkg autoremove'."
+    fi
+
+    local updates="" update_count=0 update_rc=0
+    if have timeout; then
+        updates=$(timeout 20 xbps-install -un 2>/dev/null) || update_rc=$?
+    else
+        updates=$(xbps-install -un 2>/dev/null) || update_rc=$?
+    fi
+    if (( update_rc != 0 )); then
+        check_warn "Could not check pending updates (network or repository problem?)."
+    elif [[ -n $updates ]]; then
+        update_count=$(printf '%s\n' "$updates" | wc -l)
+        check_warn "$update_count package update(s) available; run 'void update'."
+    else
+        check_ok "No pending updates (from cached repository indexes)."
+    fi
+
+    local root_use root_pct
+    root_use=$(df -P / 2>/dev/null | awk 'NR==2 {gsub(/%/, "", $5); print $5}')
+    root_pct=${root_use:-0}
+    if (( root_pct >= 90 )); then
+        check_fail "Root filesystem is ${root_pct}% full; free some space."
+    elif (( root_pct >= 80 )); then
+        check_warn "Root filesystem is ${root_pct}% full."
+    else
+        check_ok "Root filesystem has room (${root_pct}% used)."
+    fi
+
+    if (( EUID != 0 )) && ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qx wheel; then
+        check_warn "Your user is not in the 'wheel' group; sudo may not be configured."
+    else
+        check_ok "Privilege escalation looks available."
+    fi
+
+    printf '\n'
+    if (( DOCTOR_FAILURES > 0 )); then
+        err "$DOCTOR_FAILURES problem(s), $DOCTOR_WARNINGS warning(s)."
+        return 1
+    elif (( DOCTOR_WARNINGS > 0 )); then
+        warn "$DOCTOR_WARNINGS warning(s), no hard failures."
+        return 0
+    else
+        ok "Everything looks good."
+        return 0
+    fi
+}
+
+# --- systemd cheat sheet ---------------------------------------------
+
+cheat_all() {
+    cat <<'EOF'
+PACKAGES
+  apt install foo             →  void pkg install foo
+  apt remove foo              →  void pkg remove foo
+  apt update                  →  void pkg update        (refresh indexes)
+  apt upgrade                 →  void update             (sync + full upgrade)
+  pacman -Syu                 →  void update
+  apt search foo              →  void pkg search foo
+  apt show foo                →  void pkg info foo
+  apt list --installed        →  void pkg list
+  apt autoremove              →  void pkg autoremove
+  apt clean                   →  void pkg clean
+  apt-mark hold foo           →  void pkg hold foo
+  dpkg -L foo                 →  void pkg files foo
+  dpkg -S /path/to/file       →  void pkg owns /path/to/file
+
+SERVICES
+  systemctl start foo         →  void svc start foo
+  systemctl stop foo          →  void svc stop foo
+  systemctl restart foo       →  void svc restart foo
+  systemctl reload foo        →  void svc reload foo
+  systemctl status foo        →  void svc status foo
+  systemctl enable foo        →  void svc enable foo
+  systemctl enable --now foo  →  void svc enable --now foo
+  systemctl disable foo       →  void svc disable foo
+  systemctl list-units        →  void svc list
+  systemctl list-unit-files   →  void svc list --all
+  systemctl cat foo           →  cat /etc/sv/foo/run
+  systemctl edit foo          →  void svc edit foo
+  systemctl daemon-reload     →  not needed; runit reads run scripts directly
+
+LOGS
+  journalctl -u foo           →  void logs foo
+  journalctl -u foo -f        →  void logs -f foo
+  journalctl -b               →  dmesg
+  journalctl -xe              →  void logs <service>  or  void svc status <service>
+
+SYSTEM
+  hostnamectl                 →  hostname; edit /etc/hostname
+  timedatectl                 →  date; set timezone with:
+                                 ln -sf /usr/share/zoneinfo/Region/City /etc/localtime
+  localectl                   →  edit /etc/rc.conf (KEYMAP, XKBLAYOUT)
+  systemctl reboot            →  sudo reboot
+  systemctl poweroff          →  sudo poweroff
+  systemctl suspend           →  loginctl suspend (elogind)
+
+NETWORK
+  nmcli                       →  nmcli (NetworkManager works the same)
+  systemctl restart NetworkManager
+                              →  void svc restart NetworkManager
+  netplan / ifupdown          →  void svc enable --now dhcpcd
+                                 (or use NetworkManager / wpa_supplicant)
+
+TIPS
+  - A service is a directory in /etc/sv with an executable run script.
+  - Enabling means symlinking /etc/sv/<name> into /var/service.
+  - There is no systemd journal; check /var/log and each service's log/run.
+  - Create a service:  void svc create <name> --exec "command"
+  - List everything:   void svc list --all
+EOF
+}
+
+cmd_cheat() {
+    local query="${1:-}" output
+    if [[ -z $query || $query == -h || $query == --help ]]; then
+        cheat_all
+        return 0
+    fi
+    output=$(cheat_all | awk -v q="$query" '
+        BEGIN { q = tolower(q); show = 0 }
+        /^[A-Z][A-Z ]*$/ {
+            show = (index(tolower($0), q) > 0)
+            if (show) print
+            next
+        }
+        {
+            if (show || index(tolower($0), q) > 0) print
+        }
+    ')
+    if [[ -z $output ]]; then
+        warn "No cheat-sheet entries match '$query'."
+        return 1
+    fi
+    printf '%s\n' "$output"
+}
+
+# --- Main ------------------------------------------------------------
+
+main() {
+    # --no-color may appear anywhere; strip it before dispatching.
+    local arg
+    local -a cleaned=()
+    for arg in "$@"; do
+        if [[ $arg == --no-color ]]; then
+            FORCE_NO_COLOR=1
+        else
+            cleaned+=("$arg")
+        fi
+    done
+    set -- "${cleaned[@]}"
+
+    while (($#)); do
+        case "$1" in
+            -n|--dry-run) DRY_RUN=1; shift ;;
+            -y|--yes) ASSUME_YES=1; shift ;;
+            -q|--quiet) QUIET=1; shift ;;
+            -h|--help) setup_colors; usage; return 0 ;;
+            -V|--version) printf '%s %s\n' "$PROG" "$VERSION"; return 0 ;;
+            --) shift; break ;;
+            -*) die "Unknown global option: $1" ;;
+            *) break ;;
+        esac
+    done
+
+    setup_colors
+
+    if (( EUID != 0 )); then
+        if have sudo; then
+            SUDO_CMD=sudo
+        elif have doas; then
+            SUDO_CMD=doas
+        fi
+    fi
+
+    local command=${1:-help}
+    (($#)) && shift
+
+    case "$command" in
+        pkg|package|packages) cmd_pkg "$@" ;;
+        svc|service|services) cmd_svc "$@" ;;
+        update|upgrade|sysupgrade) pkg_upgrade "$@" ;;
+        info|sysinfo) cmd_info "$@" ;;
+        logs|log) logs_cmd "$@" ;;
+        status) cmd_svc status "$@" ;;
+        doctor|check) cmd_doctor "$@" ;;
+        cheat|systemd|migrate) cmd_cheat "$@" ;;
+        repo|repositories) cmd_repo "$@" ;;
+        desktop|desktop-db) cmd_desktop "$@" ;;
+        install|add) pkg_install "$@" ;;
+        remove|rm) pkg_remove "$@" ;;
+        search) pkg_search "$@" ;;
+        help|-h|--help)
+            if (($#)); then
+                case "$1" in
+                    pkg|package|packages) pkg_usage ;;
+                    svc|service|services) svc_usage ;;
+                    logs|log) logs_usage ;;
+                    repo|repositories) repo_usage ;;
+                    desktop|desktop-db) desktop_usage ;;
+                    cheat|systemd|migrate) cmd_cheat ;;
+                    *) usage ;;
+                esac
+            else
+                usage
+            fi
+            ;;
+        version|-V|--version) printf '%s %s\n' "$PROG" "$VERSION" ;;
+        *) die "Unknown command: '$command'. Run 'void help'." ;;
+    esac
+}
+
+main "$@"
